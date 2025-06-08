@@ -3,10 +3,10 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncMqttClient.h>
 #include <LittleFS.h>
-#include <ArduinoJson.h>
 #include <Ticker.h>
 #include <EEPROM.h>
 #include <math.h>
+#include <ArduinoJson.h>
 
 #define PULSE_PIN D6
 #define DEBOUNCE_MS 50
@@ -14,16 +14,15 @@
 #define EEPROM_SIZE 8
 #define EEPROM_ADDR 0
 
-// MQTT topic and reporting interval
 #define REPORT_INTERVAL 60  // seconds
 
 struct Config {
   char wifi_ssid[32];
   char wifi_pass[32];
   char mqtt_host[32];
-  uint16_t mqtt_port;
+  uint16_t mqtt_port = 1883;         // Default to 1883
   float meter_water;
-  uint16_t litres_per_pulse;
+  uint16_t litres_per_pulse = 10;    // Default to 10
   char mqtt_topic[64];
 } config;
 
@@ -53,7 +52,7 @@ bool loadConfig() {
     Serial.println("Failed to open config file");
     return false;
   }
-  StaticJsonDocument<384> doc;
+  JsonDocument doc; // No size argument
   DeserializationError error = deserializeJson(doc, file);
   file.close();
   if (error) {
@@ -80,7 +79,7 @@ bool loadConfig() {
 
 // Save configuration to LittleFS
 bool saveConfig() {
-  StaticJsonDocument<384> doc;
+  JsonDocument doc; // No size argument
   doc["wifi_ssid"] = config.wifi_ssid;
   doc["wifi_pass"] = config.wifi_pass;
   doc["mqtt_host"] = config.mqtt_host;
@@ -88,6 +87,7 @@ bool saveConfig() {
   doc["meter_water"] = config.meter_water;
   doc["litres_per_pulse"] = config.litres_per_pulse;
   doc["mqtt_topic"] = config.mqtt_topic;
+
   File file = LittleFS.open(CONFIG_FILE, "w");
   if (!file) {
     Serial.println("Failed to open config file for writing");
@@ -104,6 +104,35 @@ void IRAM_ATTR onPulse() {
     pulseCount++;
     lastPulse = now;
   }
+}
+
+// Save meter_water to EEPROM
+void saveMeterWaterToEEPROM(float value) {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(EEPROM_ADDR, value);
+  EEPROM.commit();
+  EEPROM.end();
+}
+
+// Load meter_water from EEPROM
+float loadMeterWaterFromEEPROM() {
+  float value = 0.0;
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(EEPROM_ADDR, value);
+  EEPROM.end();
+  return value;
+}
+
+// Captive portal logic: if not connected to WiFi, start AP and serve /config
+void startCaptivePortal() {
+  static bool apStarted = false;
+  if (!apStarted) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("PulseMeterConfig");
+    Serial.println("Started AP: PulseMeterConfig");
+    apStarted = true;
+  }
+  // Web server already serves /config
 }
 
 void setupWebServer() {
@@ -176,11 +205,20 @@ void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(config.wifi_ssid, config.wifi_pass);
   Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long startAttempt = millis();
+  const unsigned long wifiTimeout = 15000; // 15 seconds timeout
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < wifiTimeout) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi connection failed. Starting configuration AP portal.");
+    startCaptivePortal();
+  }
 }
 
 // MQTT connect logic
@@ -189,20 +227,19 @@ void connectMQTT() {
   mqttClient.connect();
 }
 
+// Handle incoming MQTT messages
 void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
-  // Build the expected topic: <prefix>/set
   char setTopic[80];
   snprintf(setTopic, sizeof(setTopic), "%s/set", config.mqtt_topic);
 
   if (strcmp(topic, setTopic) == 0) {
-    // Parse payload as JSON or plain float
     payload[len] = '\0'; // Ensure null-terminated
     float newMeter = NAN;
 
     // Try to parse as JSON: {"meter_water": 12.345}
-    StaticJsonDocument<64> doc;
+    JsonDocument doc; // No size argument
     DeserializationError err = deserializeJson(doc, payload, len);
-    if (!err && doc.containsKey("meter_water")) {
+    if (!err && doc["meter_water"].is<float>()) {
       newMeter = doc["meter_water"];
     } else {
       // Try to parse as plain float
@@ -213,77 +250,34 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
       Serial.printf("MQTT: Setting meter_water to %.3f m3 via MQTT\n", newMeter);
       config.meter_water = newMeter;
       saveMeterWaterToEEPROM(config.meter_water);
-      // Optionally, saveConfig(); // Only if you want to persist to FS immediately
     } else {
       Serial.println("MQTT: Invalid meter_water value received");
     }
   }
 }
 
-void onMqttConnect(bool sessionPresent) {
-  Serial.println("Connected to MQTT broker.");
-
-  // Subscribe to <prefix>/set
-  char setTopic[80];
-  snprintf(setTopic, sizeof(setTopic), "%s/set", config.mqtt_topic);
-  mqttClient.subscribe(setTopic, 0);
-  Serial.printf("Subscribed to MQTT topic: %s\n", setTopic);
-}
-
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
-  Serial.println("Disconnected from MQTT, reconnecting...");
-  delay(1000);
-  connectMQTT();
-}
-
 // Publish water meter data to MQTT
 void publishMQTT(float measure_water, float meter_water, unsigned long uptime) {
-  StaticJsonDocument<128> doc;
+  JsonDocument doc; // No size argument
   doc["uptime"] = uptime;
   doc["measure_water"] = measure_water;
   doc["meter_water"] = meter_water;
   char payload[128];
   size_t n = serializeJson(doc, payload, sizeof(payload));
 
-  // Build topic: <prefix>/state
   char topic[80];
   snprintf(topic, sizeof(topic), "%s/state", config.mqtt_topic);
 
   mqttClient.publish(topic, 0, false, payload, n);
 }
 
-// Captive portal logic: if not connected to WiFi, start AP and serve /config
-void startCaptivePortal() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("PulseMeterConfig");
-  Serial.println("Started AP: PulseMeterConfig");
-  // Web server already serves /config
-}
-
-// Save meter_water to EEPROM
-void saveMeterWaterToEEPROM(float value) {
-  EEPROM.begin(EEPROM_SIZE);
-  EEPROM.put(EEPROM_ADDR, value);
-  EEPROM.commit();
-  EEPROM.end();
-}
-
-// Load meter_water from EEPROM
-float loadMeterWaterFromEEPROM() {
-  float value = 0.0;
-  EEPROM.begin(EEPROM_SIZE);
-  EEPROM.get(EEPROM_ADDR, value);
-  EEPROM.end();
-  return value;
-}
-
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(500); // Increase delay to ensure serial is ready
   Serial.println("\n--- Pulse Meter Startup ---");
 
   LittleFS.begin();
-  bool configLoaded = loadConfig();
+  loadConfig(); // Remove unused variable assignment
 
   // Restore meter_water from EEPROM (overrides config file value)
   float eepromValue = loadMeterWaterFromEEPROM();
@@ -305,8 +299,17 @@ void setup() {
   }
 
   // MQTT setup
-  mqttClient.onConnect(onMqttConnect);
-  mqttClient.onDisconnect(onMqttDisconnect);
+  mqttClient.onConnect([](bool) {
+    char setTopic[80];
+    snprintf(setTopic, sizeof(setTopic), "%s/set", config.mqtt_topic);
+    mqttClient.subscribe(setTopic, 0);
+    Serial.printf("Subscribed to MQTT topic: %s\n", setTopic);
+  });
+  mqttClient.onDisconnect([](AsyncMqttClientDisconnectReason) {
+    Serial.println("Disconnected from MQTT, reconnecting...");
+    delay(1000);
+    connectMQTT();
+  });
   mqttClient.onMessage(onMqttMessage);
   connectMQTT();
 
@@ -341,20 +344,9 @@ void loop() {
 
     unsigned long uptime = (now - bootTime) / 1000;
 
-    // Prepare JSON for MQTT and logging
-    StaticJsonDocument<128> doc;
-    doc["uptime"] = uptime;
-    doc["measure_water"] = measure_water;
-    doc["meter_water"] = config.meter_water;
-    char payload[128];
-    size_t n = serializeJson(doc, payload, sizeof(payload));
-
-    // Output JSON to serial
-    Serial.print("Publishing: ");
-    Serial.println(payload);
-
     // Publish to MQTT
-    mqttClient.publish(config.mqtt_topic, 0, false, payload, n);
+    Serial.printf("Publishing to topic %s/state: uptime=%lu, measure_water=%.3f l/min, meter_water=%.3f m3\n", config.mqtt_topic, uptime, measure_water, config.meter_water);
+    publishMQTT(measure_water, config.meter_water, uptime);
 
     // Save to EEPROM if changed by at least 0.01 m3
     if (fabs(config.meter_water - lastSavedMeterWater) >= 0.01) {
