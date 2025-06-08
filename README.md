@@ -1,6 +1,6 @@
 # ESP8266 Pulse MQTT Water Meter
 
-This project is a pulse counter for ESP8266, designed for water meters (or any pulse-based metering). It reads pulses on pin D6 (with 50ms debounce), calculates water flow and total consumption, and reports the data to an MQTT broker in JSON format. Configuration is managed via a web portal.
+This project is a pulse counter for ESP8266, designed for water meters (or any pulse-based metering). It reads pulses on pin D6 (with 50ms debounce), calculates water flow and total consumption, and reports the data to an MQTT broker in JSON format. Configuration is managed via a web portal or an initial config file.
 
 ## Features
 
@@ -28,6 +28,34 @@ This project is a pulse counter for ESP8266, designed for water meters (or any p
 - **Startup Logging:** Serial output shows configuration and MQTT connection status.
 
 ## Configuration
+
+You can configure the device in two ways:
+
+### 1. Initial Configuration File
+
+Create a `data` folder in your project root and add a `config.json` file like this:
+
+```json
+{
+  "wifi_ssid": "your_wifi_ssid",
+  "wifi_pass": "your_wifi_password",
+  "mqtt_host": "mqtt.example.com",
+  "mqtt_port": 1883,
+  "meter_water": 0.0,
+  "litres_per_pulse": 10,
+  "mqtt_topic": "watermeter/kitchen"
+}
+```
+
+Upload this file to the device's filesystem with:
+
+```sh
+pio run -t uploadfs
+```
+
+This will pre-load your configuration so the device can connect to WiFi and MQTT on first boot.
+
+### 2. Web Portal
 
 On first boot or if no config is found, the device starts in AP mode (`PulseMeterConfig`). Connect to this WiFi and browse to [http://192.168.4.1/config](http://192.168.4.1/config) to set up:
 
@@ -67,6 +95,12 @@ You can revisit `/config` at any time to change settings.
 
    ```sh
    pio device monitor
+   ```
+
+5. (Optional) Upload initial configuration:
+
+   ```sh
+   pio run -t uploadfs
    ```
 
 ## Hardware
