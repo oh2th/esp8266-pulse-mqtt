@@ -3,7 +3,7 @@
   "wifi_pass": "your_wifi_password",
   "mqtt_host": "mqtt.example.com",
   "mqtt_port": 1883,
-  "meter_water": 0.000,
+  "meter_water": 0.0,
   "litres_per_pulse": 10,
   "mqtt_topic": "watermeter/kitchen"
 }
